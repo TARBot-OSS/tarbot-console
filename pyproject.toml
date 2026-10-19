@@ -1,0 +1,25 @@
+[project]
+name = "tarbot-console"
+version = "0.1.0"
+description = "Shared PAM-gated split-screen admin console for the TAR Discord bots"
+requires-python = ">=3.11"
+dependencies = [
+    "discord.py>=2.4",
+    "prompt_toolkit>=3.0.0",
+    "python-pam>=2.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["tarbot_console"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "S110"]
+ignore = ["E501"]
