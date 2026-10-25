@@ -80,6 +80,19 @@ class ConsoleAwareStreamHandler(logging.StreamHandler):
             self.handleError(record)
 
 
+def _append_to_pane(area: TextArea, text: str) -> None:
+    """Append a line to a read-only pane, following the tail only if the reader is already there.
+
+    Setting `area.text` resets the cursor, so the previous offset is restored when the
+    reader has scrolled up.
+    """
+    buf = area.buffer
+    at_bottom = buf.document.cursor_position_row >= buf.document.line_count - 2
+    saved = buf.cursor_position
+    area.text += f"{text}\n"
+    buf.cursor_position = len(area.text) if at_bottom else min(saved, len(area.text))
+
+
 def is_linux_admin(username: str) -> bool:
     """Checks if a username is an administrator (root or member of sudo/wheel) on the Linux system."""
     try:
@@ -194,8 +207,7 @@ class ConsoleCore:
 
         def _update() -> None:
             if self.log_area and self.app:
-                self.log_area.text += f"{text}\n"
-                self.log_area.buffer.cursor_position = len(self.log_area.text)
+                _append_to_pane(self.log_area, text)
                 self.app.invalidate()
 
         if self._loop and self._loop.is_running():
@@ -215,8 +227,7 @@ class ConsoleCore:
 
         def _update() -> None:
             if self.output_area and self.app:
-                self.output_area.text += f"{text}\n"
-                self.output_area.buffer.cursor_position = len(self.output_area.text)
+                _append_to_pane(self.output_area, text)
                 self.app.invalidate()
 
         if self._loop and self._loop.is_running():

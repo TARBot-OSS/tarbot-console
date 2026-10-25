@@ -8,8 +8,10 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from prompt_toolkit.widgets import TextArea
 
 from tarbot_console import ConsoleAwareStreamHandler, ConsoleCore
+from tarbot_console.core import _append_to_pane
 
 
 class DemoConsole(ConsoleCore):
@@ -77,3 +79,22 @@ def test_handler_hides_console_cmd_echo():
     record = logging.LogRecord("demo.console", logging.INFO, "", 0, "[CMD] Executed: x", None, None)
     handler.emit(record)
     assert ConsoleAwareStreamHandler._log_buffer == []
+
+
+def test_append_keeps_scrolled_up_reader_in_place():
+    area = TextArea(text="".join(f"line {i}\n" for i in range(200)), read_only=True)
+    area.buffer.cursor_position = 500
+
+    _append_to_pane(area, "NEW LINE")
+
+    assert area.text.endswith("NEW LINE\n")
+    assert area.buffer.cursor_position == 500
+
+
+def test_append_follows_tail_when_reader_is_at_bottom():
+    area = TextArea(text="".join(f"line {i}\n" for i in range(200)), read_only=True)
+    area.buffer.cursor_position = len(area.text)
+
+    _append_to_pane(area, "NEW LINE")
+
+    assert area.buffer.cursor_position == len(area.text)
