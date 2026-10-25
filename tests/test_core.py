@@ -98,3 +98,29 @@ def test_append_follows_tail_when_reader_is_at_bottom():
     _append_to_pane(area, "NEW LINE")
 
     assert area.buffer.cursor_position == len(area.text)
+
+
+def _completion_texts(console, text: str) -> list[str]:
+    from prompt_toolkit.document import Document
+
+    completer = console._get_completer()
+    return [c.text for c in completer.get_completions(Document(text), None)]
+
+
+def test_default_argument_options_leave_nested_completions_unchanged(console):
+    console.is_authenticated = False
+    assert _completion_texts(console, "clear ") == ["output", "logs", "all"]
+
+
+def test_argument_options_hook_fills_slot_and_defers_otherwise(console):
+    console.is_authenticated = True
+    console.argument_options = lambda head: ["AAA", "BBB"] if head == ["ping", "x"] else None
+
+    assert _completion_texts(console, "ping x ") == ["AAA", "BBB"]
+    assert _completion_texts(console, "ping x b") == ["BBB"]
+    assert _completion_texts(console, "clear ") == ["output", "logs", "all"]
+
+
+def test_password_mode_offers_no_completions(console):
+    console._is_password_mode = True
+    assert console._get_completer() is None
