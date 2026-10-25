@@ -16,12 +16,13 @@ import shlex
 import socket
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import discord
 from prompt_toolkit.application import Application
-from prompt_toolkit.completion import DynamicCompleter, NestedCompleter
+from prompt_toolkit.completion import Completer, Completion, DynamicCompleter, NestedCompleter
 from prompt_toolkit.filters import Condition, has_completions
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -91,6 +92,29 @@ def _append_to_pane(area: TextArea, text: str) -> None:
     saved = buf.cursor_position
     area.text += f"{text}\n"
     buf.cursor_position = len(area.text) if at_bottom else min(saved, len(area.text))
+
+
+class ArgumentCompleter(Completer):
+    """Completes an argument slot that a NestedCompleter cannot express.
+
+    `options` receives the whitespace-split words before the word being completed and returns
+    the candidates for that slot, or None to defer to `base`.
+    """
+
+    def __init__(self, base: Completer, options: Callable[[list[str]], list[str] | None]) -> None:
+        self.base = base
+        self.options = options
+
+    def get_completions(self, document, complete_event):
+        word = document.get_word_before_cursor(WORD=True)
+        head = document.text_before_cursor[: len(document.text_before_cursor) - len(word)].split()
+        candidates = self.options(head)
+        if candidates is None:
+            yield from self.base.get_completions(document, complete_event)
+            return
+        for candidate in candidates:
+            if candidate.lower().startswith(word.lower()):
+                yield Completion(candidate, start_position=-len(word))
 
 
 def is_linux_admin(username: str) -> bool:
@@ -172,9 +196,19 @@ class ConsoleCore:
             return f"{self.bot_name.lower()} [{self.authenticated_user}]> "
         return f"{self.bot_name.lower()} [LOCKED]> "
 
-    def _get_completer(self) -> NestedCompleter | None:
+    def argument_options(self, head: list[str]) -> list[str] | None:
+        """Hook: candidates for an argument slot the nested completer cannot express.
+
+        Return None to defer to the nested completer. Bots override this instead of the completer.
+        """
+        return None
+
+    def _get_completer(self) -> Completer | None:
         if self._is_password_mode:
             return None
+        return ArgumentCompleter(self._nested_completer(), self.argument_options)
+
+    def _nested_completer(self) -> NestedCompleter:
         layout = {
             "view": {"split": None, "logs": None, "output": None},
             "minimize": {"output": None, "logs": None},
