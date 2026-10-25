@@ -1,6 +1,6 @@
 [project]
 name = "tarbot-console"
-version = "0.1.1"
+version = "0.2.0"
 description = "Shared PAM-gated split-screen admin console for the TAR Discord bots"
 requires-python = ">=3.11"
 dependencies = [
