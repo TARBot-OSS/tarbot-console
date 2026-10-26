@@ -25,8 +25,9 @@ TARVERI_VERIFICATION_COLUMNS: Final[frozenset[str]] = frozenset(
 )
 
 # Role names that mark a verified student, lowercased, with any "TARUMT " prefix removed.
-# Faculty codes and study levels are the names TARVeri assigns. "verified" and "bachelor's degree"
-# are kept from earlier TARClub releases so existing servers keep their behaviour.
+# Faculty codes and study levels are the names TARVeri assigns. "verified" is TARVeri's base role
+# ("TARUMT Verified"). "bachelor's degree" is the older name of the Degree level role. TARVeri still
+# resolves it on existing servers, so both stay.
 TARVERI_STUDENT_ROLE_NAMES: Final[frozenset[str]] = frozenset(
     {
         "cpus",
