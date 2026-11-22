@@ -37,6 +37,7 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Frame, TextArea
 
@@ -81,17 +82,97 @@ class ConsoleAwareStreamHandler(logging.StreamHandler):
             self.handleError(record)
 
 
-def _append_to_pane(area: TextArea, text: str) -> None:
-    """Append a line to a read-only pane, following the tail only if the reader is already there.
+# Lines kept per pane. Rebuilding the pane text is O(size) per append, so an unbounded pane
+# slows every log line down over a long session.
+MAX_PANE_LINES = 5000
+# Lines moved per mouse wheel tick.
+WHEEL_STEP = 3
 
-    Setting `area.text` resets the cursor, so the previous offset is restored when the
-    reader has scrolled up.
+
+def _is_following(area: TextArea) -> bool:
+    """Whether the pane sticks to the newest line. Set by `_scroll_pane`; new panes follow."""
+    return getattr(area, "_tarbot_follow", True)
+
+
+def _append_to_pane(area: TextArea, text: str) -> None:
+    """Append a line to a read-only pane, following the tail only while the reader is following.
+
+    Following is an explicit flag rather than "is the cursor near the end": with logs streaming,
+    a reader who scrolled up one or two lines used to be snapped back to the bottom.
+    Setting `area.text` resets the cursor, so the previous offset is restored (shifted by any
+    lines trimmed off the top) when the reader has scrolled up.
     """
     buf = area.buffer
-    at_bottom = buf.document.cursor_position_row >= buf.document.line_count - 2
+    follow = _is_following(area)
     saved = buf.cursor_position
-    area.text += f"{text}\n"
-    buf.cursor_position = len(area.text) if at_bottom else min(saved, len(area.text))
+    new_text = area.text + f"{text}\n"
+    trimmed = 0
+    if new_text.count("\n") > MAX_PANE_LINES:
+        cut = 0
+        for _ in range(new_text.count("\n") - MAX_PANE_LINES):
+            cut = new_text.index("\n", cut) + 1
+        trimmed = cut
+        new_text = new_text[cut:]
+    area.text = new_text
+    buf.cursor_position = len(new_text) if follow else max(0, min(saved - trimmed, len(new_text)))
+
+
+def _scroll_pane(area: TextArea, rows: int) -> None:
+    """Scroll a read-only pane by `rows` lines (negative = up) and update its follow flag.
+
+    The window only scrolls to keep the cursor visible, so the cursor is placed just outside the
+    visible lines. Moving it relative to itself (the old way) left the view still until the cursor
+    crossed the edge, which felt stuck, especially on long wrapped lines.
+    """
+    buf = area.buffer
+    doc = buf.document
+    last = doc.line_count - 1
+    row = doc.cursor_position_row
+    info = area.window.render_info
+    if rows < 0:
+        # `min` with the cursor row: after a quick repeat the last render is stale, the cursor is not.
+        anchor = min(info.first_visible_line(), row) if info else row
+    else:
+        anchor = max(info.last_visible_line(), row) if info else row
+    target = max(0, min(last, anchor + rows))
+    buf.cursor_position = doc.translate_row_col_to_index(target, 0)
+    area._tarbot_follow = target >= last
+    if area._tarbot_follow:
+        buf.cursor_position = len(area.text)
+
+
+def _clear_pane(area: TextArea) -> None:
+    """Empty a pane and make it follow new lines again."""
+    area.text = ""
+    area._tarbot_follow = True
+
+
+def _page_rows(area: TextArea) -> int:
+    """One page: the visible height minus one line of overlap."""
+    info = area.window.render_info
+    return max(1, info.window_height - 1) if info else 10
+
+
+def _install_wheel_scroll(area: TextArea, on_change: Callable[[], None] | None = None) -> None:
+    """Route mouse wheel ticks on the pane through `_scroll_pane`.
+
+    shortcut: replaces the Window's private `_mouse_handler` (prompt_toolkit has no public hook);
+    its own wheel handler scrolls 1 row and sticks on wrapped lines. Revisit if prompt_toolkit
+    adds a public wheel callback.
+    """
+
+    def _handler(mouse_event: MouseEvent):
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            _scroll_pane(area, -WHEEL_STEP)
+        elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            _scroll_pane(area, WHEEL_STEP)
+        else:
+            return NotImplemented
+        if on_change:
+            on_change()
+        return None
+
+    area.window._mouse_handler = _handler
 
 
 class ArgumentCompleter(Completer):
@@ -142,7 +223,6 @@ def is_linux_admin(username: str) -> bool:
         return False
     except (KeyError, ImportError, Exception):
         return False
-
 
 
 class ConsoleCore:
@@ -224,15 +304,17 @@ class ConsoleCore:
         }
         if not self.is_authenticated:
             return NestedCompleter.from_nested_dict(layout)
-        return NestedCompleter.from_nested_dict({
-            **layout,
-            "say": None,
-            "eval": None,
-            "lock": None,
-            "logout": None,
-            "user": {"list": None, "add": None, "remove": None},
-            **self.extra_completions,
-        })
+        return NestedCompleter.from_nested_dict(
+            {
+                **layout,
+                "say": None,
+                "eval": None,
+                "lock": None,
+                "logout": None,
+                "user": {"list": None, "add": None, "remove": None},
+                **self.extra_completions,
+            }
+        )
 
     def append_log(self, text: str) -> None:
         """Appends log text to the top system logs pane and scrolls to bottom."""
@@ -295,9 +377,7 @@ class ConsoleCore:
 
         # Check if stdin is an interactive TTY. If running as systemd daemon or piped, disable CLI.
         if sys.stdin is None or not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
-            self.log.info(
-                "[Console] Non-interactive environment detected (systemd/pipe). Terminal CLI disabled."
-            )
+            self.log.info("[Console] Non-interactive environment detected (systemd/pipe). Terminal CLI disabled.")
             return
 
         self._before_start()
@@ -323,6 +403,7 @@ class ConsoleCore:
             focusable=False,
         )
         self.log_area.buffer.cursor_position = len(self.log_area.text)
+        _install_wheel_scroll(self.log_area)
 
         initial_output = (
             f"🎮 {self.bot_name} Console initialized.\n"
@@ -337,19 +418,22 @@ class ConsoleCore:
             focusable=False,
         )
         self.output_area.buffer.cursor_position = len(self.output_area.text)
+        _install_wheel_scroll(self.output_area)
 
-        style = Style.from_dict({
-            "text-area.prompt": "ansicyan bold",
-            "frame.label": "ansigreen bold",
-            "frame.border": "#45475a",
-            "minimized-bar": "bg:#1e1e2e #89b4fa bold",
-            "minimized-bar.logs": "bg:#181825 #a6adc8",
-            "completion-menu": "bg:#1e1e2e #cdd6f4",
-            "completion-menu.completion": "bg:#1e1e2e #cdd6f4",
-            "completion-menu.completion.current": "bg:#45475a #89b4fa bold",
-            "scrollbar.background": "bg:#11111b",
-            "scrollbar.button": "bg:#585b70",
-        })
+        style = Style.from_dict(
+            {
+                "text-area.prompt": "ansicyan bold",
+                "frame.label": "ansigreen bold",
+                "frame.border": "#45475a",
+                "minimized-bar": "bg:#1e1e2e #89b4fa bold",
+                "minimized-bar.logs": "bg:#181825 #a6adc8",
+                "completion-menu": "bg:#1e1e2e #cdd6f4",
+                "completion-menu.completion": "bg:#1e1e2e #cdd6f4",
+                "completion-menu.completion.current": "bg:#45475a #89b4fa bold",
+                "scrollbar.background": "bg:#11111b",
+                "scrollbar.button": "bg:#585b70",
+            }
+        )
 
         self.input_box = TextArea(
             height=1,
@@ -376,39 +460,39 @@ class ConsoleCore:
         def _toggle_logs_kb(event):
             self._toggle_logs_minimized()
 
+        def _page_target() -> TextArea | None:
+            if not self._output_minimized and self.output_area:
+                return self.output_area
+            return self.log_area
+
         @kb.add("pageup")
         def _scroll_up(event):
-            if not self._output_minimized and self.output_area:
-                self.output_area.buffer.cursor_up(count=10)
-            elif self.log_area:
-                self.log_area.buffer.cursor_up(count=10)
+            if area := _page_target():
+                _scroll_pane(area, -_page_rows(area))
 
         @kb.add("pagedown")
         def _scroll_down(event):
-            if not self._output_minimized and self.output_area:
-                self.output_area.buffer.cursor_down(count=10)
-            elif self.log_area:
-                self.log_area.buffer.cursor_down(count=10)
+            if area := _page_target():
+                _scroll_pane(area, _page_rows(area))
 
         @kb.add("c-up")
+        @kb.add("s-pageup")
         def _scroll_logs_up(event):
             if self.log_area:
-                self.log_area.buffer.cursor_up(count=10)
+                _scroll_pane(self.log_area, -_page_rows(self.log_area))
 
         @kb.add("c-down")
+        @kb.add("s-pagedown")
         def _scroll_logs_down(event):
             if self.log_area:
-                self.log_area.buffer.cursor_down(count=10)
+                _scroll_pane(self.log_area, _page_rows(self.log_area))
 
-        @kb.add("s-pageup")
-        def _scroll_logs_sup(event):
-            if self.log_area:
-                self.log_area.buffer.cursor_up(count=10)
-
-        @kb.add("s-pagedown")
-        def _scroll_logs_sdown(event):
-            if self.log_area:
-                self.log_area.buffer.cursor_down(count=10)
+        @kb.add("c-end")
+        def _jump_to_latest(event):
+            # Back to the newest line in both panes, and follow it again.
+            for area in (self.log_area, self.output_area):
+                if area:
+                    _scroll_pane(area, area.document.line_count)
 
         @kb.add("tab")
         def _on_tab(event):
@@ -474,7 +558,7 @@ class ConsoleCore:
         logs_frame = ConditionalContainer(
             Frame(
                 self.log_area,
-                title="📡 System Logs (Ctrl+Up/Down to scroll • F3 to minimize)",
+                title="📡 System Logs (Ctrl+Up/Down or wheel to scroll • Ctrl+End latest • F3 to minimize)",
                 height=Dimension(weight=80, min=6),
             ),
             filter=Condition(lambda: not self._logs_minimized),
@@ -493,7 +577,7 @@ class ConsoleCore:
         output_frame = ConditionalContainer(
             Frame(
                 self.output_area,
-                title="💻 Terminal Output (PgUp/PgDn to scroll • F2 to minimize)",
+                title="💻 Terminal Output (PgUp/PgDn or wheel to scroll • F2 to minimize)",
                 height=Dimension(weight=15, min=4),
             ),
             filter=Condition(lambda: not self._output_minimized),
@@ -509,13 +593,15 @@ class ConsoleCore:
             filter=Condition(lambda: self._output_minimized),
         )
 
-        body = HSplit([
-            logs_frame,
-            logs_bar,
-            output_frame,
-            output_bar,
-            self.input_box,
-        ])
+        body = HSplit(
+            [
+                logs_frame,
+                logs_bar,
+                output_frame,
+                output_bar,
+                self.input_box,
+            ]
+        )
 
         root = FloatContainer(
             content=body,
@@ -654,6 +740,7 @@ class ConsoleCore:
             self.write_output("📺 All panes restored to Split view.")
         if self.app:
             self.app.invalidate()
+
     async def handle_command(self, raw_line: str) -> None:
         """Parses and executes a console command line."""
         try:
@@ -832,10 +919,14 @@ class ConsoleCore:
             )
         else:
             self._failed_attempts += 1
-            self.write_output(f"❌ [AUTH FAILED] Invalid credentials for user '{username}'. Attempt {self._failed_attempts}/3.")
+            self.write_output(
+                f"❌ [AUTH FAILED] Invalid credentials for user '{username}'. Attempt {self._failed_attempts}/3."
+            )
             if self._failed_attempts >= 3:
                 self._locked_until = time.monotonic() + 900  # 15 minutes
-                self.write_output("🚨 [SECURITY LOCKOUT] 3 failed authentication attempts detected. Console locked for 15 minutes.")
+                self.write_output(
+                    "🚨 [SECURITY LOCKOUT] 3 failed authentication attempts detected. Console locked for 15 minutes."
+                )
                 await self._dispatch_security_alert(
                     title="🚨 Console Brute-Force Lockout",
                     description=f"**3 failed authentication attempts** detected for user **{username}**.\nConsole locked for 15 minutes.",
@@ -985,7 +1076,9 @@ class ConsoleCore:
             for a in admins:
                 added_by = a.get("added_by") or "system"
                 added_at = a.get("added_at") or "unknown"
-                self.write_output(f" • {a['username']} (Role: {a.get('role', 'admin')}, Added by: {added_by}, Date: {added_at})")
+                self.write_output(
+                    f" • {a['username']} (Role: {a.get('role', 'admin')}, Added by: {added_by}, Date: {added_at})"
+                )
             self.write_output("===========================================================")
         elif sub == "add":
             if len(args) < 2:
@@ -995,6 +1088,7 @@ class ConsoleCore:
             # Verify target exists as a valid Linux user
             try:
                 import pwd
+
                 pwd.getpwnam(target)
             except (KeyError, ImportError):
                 self.write_output(f"❌ [ERROR] User '{target}' does not exist on this Linux system.")
@@ -1087,15 +1181,15 @@ class ConsoleCore:
         if self.is_active:
             if target in ("all", "both"):
                 if self.log_area:
-                    self.log_area.text = ""
+                    _clear_pane(self.log_area)
                 if self.output_area:
-                    self.output_area.text = ""
+                    _clear_pane(self.output_area)
             elif target in ("logs", "log"):
                 if self.log_area:
-                    self.log_area.text = ""
+                    _clear_pane(self.log_area)
             else:
                 if self.output_area:
-                    self.output_area.text = ""
+                    _clear_pane(self.output_area)
             if self.app:
                 self.app.invalidate()
         elif sys.stdout is not None and hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
@@ -1153,4 +1247,3 @@ class ConsoleCore:
         finally:
             if self._loop and self._loop.is_running() and "pytest" not in sys.modules:
                 self._loop.call_soon(sys.exit, 0)
-

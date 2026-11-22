@@ -8,10 +8,19 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from prompt_toolkit.data_structures import Point
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.widgets import TextArea
 
 from tarbot_console import ConsoleAwareStreamHandler, ConsoleCore
-from tarbot_console.core import _append_to_pane
+from tarbot_console.core import (
+    WHEEL_STEP,
+    _append_to_pane,
+    _clear_pane,
+    _install_wheel_scroll,
+    _is_following,
+    _scroll_pane,
+)
 
 
 class DemoConsole(ConsoleCore):
@@ -81,23 +90,81 @@ def test_handler_hides_console_cmd_echo():
     assert ConsoleAwareStreamHandler._log_buffer == []
 
 
+def _pane(lines: int = 200) -> TextArea:
+    area = TextArea(text="".join(f"line {i}\n" for i in range(lines)), read_only=True)
+    area.buffer.cursor_position = len(area.text)
+    return area
+
+
 def test_append_keeps_scrolled_up_reader_in_place():
-    area = TextArea(text="".join(f"line {i}\n" for i in range(200)), read_only=True)
-    area.buffer.cursor_position = 500
+    area = _pane()
+    _scroll_pane(area, -50)
+    saved = area.buffer.cursor_position
 
     _append_to_pane(area, "NEW LINE")
 
     assert area.text.endswith("NEW LINE\n")
-    assert area.buffer.cursor_position == 500
+    assert area.buffer.cursor_position == saved
+
+
+def test_small_scroll_is_not_snapped_back_by_streaming_logs():
+    # The old rule treated "within 2 lines of the end" as following, so one wheel tick up
+    # was undone by the next log line.
+    area = _pane()
+    _scroll_pane(area, -1)
+    for i in range(5):
+        _append_to_pane(area, f"burst {i}")
+    assert area.buffer.cursor_position < len(area.text)
+    assert not _is_following(area)
 
 
 def test_append_follows_tail_when_reader_is_at_bottom():
-    area = TextArea(text="".join(f"line {i}\n" for i in range(200)), read_only=True)
-    area.buffer.cursor_position = len(area.text)
+    area = _pane()
 
     _append_to_pane(area, "NEW LINE")
 
     assert area.buffer.cursor_position == len(area.text)
+
+
+def test_scrolling_back_to_the_bottom_resumes_following():
+    area = _pane()
+    _scroll_pane(area, -30)
+    _scroll_pane(area, 1000)
+    assert _is_following(area)
+    _append_to_pane(area, "NEW LINE")
+    assert area.buffer.cursor_position == len(area.text)
+
+
+def test_pane_is_capped_and_scrolled_position_shifts_with_trim(monkeypatch):
+    monkeypatch.setattr("tarbot_console.core.MAX_PANE_LINES", 100)
+    area = _pane(100)
+    _scroll_pane(area, -20)
+    row_text = area.document.current_line
+
+    _append_to_pane(area, "NEW LINE")
+
+    assert area.text.count("\n") == 100
+    assert area.text.startswith("line 1\n")
+    assert area.document.current_line == row_text
+
+
+def test_wheel_ticks_scroll_the_pane_and_stop_following():
+    area = _pane()
+    _install_wheel_scroll(area)
+    event = MouseEvent(
+        position=Point(0, 0), event_type=MouseEventType.SCROLL_UP, button=MouseButton.NONE, modifiers=frozenset()
+    )
+
+    assert area.window._mouse_handler(event) is None
+    assert not _is_following(area)
+    assert area.document.cursor_position_row == area.document.line_count - 1 - WHEEL_STEP
+
+
+def test_clear_makes_pane_follow_again():
+    area = _pane()
+    _scroll_pane(area, -10)
+    _clear_pane(area)
+    assert _is_following(area)
 
 
 def _completion_texts(console, text: str) -> list[str]:
